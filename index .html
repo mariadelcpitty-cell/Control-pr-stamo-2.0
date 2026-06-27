@@ -975,14 +975,49 @@
                 }
 
                 let baseDate = parseDateAsLocal(client.loanDate);
-                
+                let isNewOrExtension = true;
+                let actualEventDate = baseDate;
+
                 if (client.payments.length > 0) {
-                    baseDate = parseDateAsLocal(client.payments[client.payments.length - 1].date);
+                    const lastPayment = client.payments[client.payments.length - 1];
+                    baseDate = parseDateAsLocal(lastPayment.date);
+                    actualEventDate = new Date(baseDate.getTime());
+
+                    if (lastPayment.desc === "Ampliación Préstamo") {
+                        isNewOrExtension = true;
+                    } else {
+                        isNewOrExtension = false;
+                        // Seguro anti-cobro doble: Si el último pago se hizo durante un periodo de maduración,
+                        // asumimos que cubrió ese corte y avanzamos la fecha base al siguiente ciclo.
+                        let potentialNextCut = getNextPaymentDate(baseDate, client.period);
+                        const dayOfPayment = baseDate.getDate();
+                        const is15th = potentialNextCut.getDate() === 15;
+                        let wasMature = false;
+                        
+                        if (client.period === 'quincenal') {
+                            if (is15th && dayOfPayment >= 8) wasMature = true;
+                            if (!is15th && dayOfPayment >= 22) wasMature = true;
+                        } else if (client.period === 'mensual') {
+                            if (dayOfPayment >= 22) wasMature = true;
+                        }
+
+                        if (wasMature) {
+                            baseDate = potentialNextCut; 
+                        }
+                    }
                 }
 
                 let nextCut = getNextPaymentDate(baseDate, client.period);
 
-                // 1. Intereses Vencidos / Al cobro: Fechas de corte que ya llegaron (<= checkDate)
+                // REGLA DE LOS 5 DÍAS (Solo para Préstamos Nuevos o Ampliaciones)
+                if (isNewOrExtension) {
+                    const daysToCut = getDaysDifference(actualEventDate, nextCut);
+                    if (daysToCut <= 5) {
+                        nextCut = getNextPaymentDate(nextCut, client.period);
+                    }
+                }
+
+                // 1. Intereses Vencidos / Al cobro: Fechas de corte que ya llegaron
                 while (nextCut <= checkDate) {
                     const cutDateString = `${nextCut.getFullYear()}-${(nextCut.getMonth()+1).toString().padStart(2,'0')}-${nextCut.getDate().toString().padStart(2,'0')}`;
                     const formattedDateString = formatDate(cutDateString);
@@ -1001,36 +1036,41 @@
                     nextCut = getNextPaymentDate(nextCut, client.period);
                 }
 
-                // 2. Maduración Temprana: Los días 8 y 22 los intereses se vuelven exigibles
-                const dayOfCheck = checkDate.getDate();
-                const is15thCut = nextCut.getDate() === 15;
+                // 2. Maduración Temprana (Días 8 y 22)
+                const daysToNextCut = getDaysDifference(checkDate, nextCut);
                 
-                let matureEarly = false;
-                if (client.period === 'quincenal') {
-                    if (is15thCut && dayOfCheck >= 8 && dayOfCheck < 15) {
-                        matureEarly = true;
-                    } else if (!is15thCut && dayOfCheck >= 22 && nextCut > checkDate) {
-                        matureEarly = true;
-                    }
-                } else if (client.period === 'mensual') {
-                    if (dayOfCheck >= 22 && nextCut > checkDate) {
-                        matureEarly = true;
-                    }
-                }
-
-                if (matureEarly) {
-                    const cutDateString = `${nextCut.getFullYear()}-${(nextCut.getMonth()+1).toString().padStart(2,'0')}-${nextCut.getDate().toString().padStart(2,'0')}`;
-                    const formattedDateString = formatDate(cutDateString);
-                    const alreadyInUnpaid = client.unpaidPeriods && client.unpaidPeriods.some(up => up.dateStr === formattedDateString);
+                // Evitamos cobrar meses adelantados, solo madura si el corte está cerca (<= 10 días)
+                if (daysToNextCut > 0 && daysToNextCut <= 10) {
+                    const dayOfCheck = checkDate.getDate();
+                    const is15thCut = nextCut.getDate() === 15;
+                    let matureEarly = false;
                     
-                    if (!alreadyInUnpaid) {
-                        let interestForPeriod = client.balance * (client.interestRate / 100);
-                        totalInterest += interestForPeriod; // ¡Se suma a la deuda real exigible!
-                        pendingPayments.push({ 
-                            date: new Date(nextCut.getTime()), 
-                            interest: interestForPeriod,
-                            isProjected: false // Es una deuda exigible, no una proyección visual
-                        });
+                    if (client.period === 'quincenal') {
+                        if (is15thCut && dayOfCheck >= 8) {
+                            matureEarly = true;
+                        } else if (!is15thCut && dayOfCheck >= 22) {
+                            matureEarly = true;
+                        }
+                    } else if (client.period === 'mensual') {
+                        if (dayOfCheck >= 22) {
+                            matureEarly = true;
+                        }
+                    }
+
+                    if (matureEarly) {
+                        const cutDateString = `${nextCut.getFullYear()}-${(nextCut.getMonth()+1).toString().padStart(2,'0')}-${nextCut.getDate().toString().padStart(2,'0')}`;
+                        const formattedDateString = formatDate(cutDateString);
+                        const alreadyInUnpaid = client.unpaidPeriods && client.unpaidPeriods.some(up => up.dateStr === formattedDateString);
+                        
+                        if (!alreadyInUnpaid) {
+                            let interestForPeriod = client.balance * (client.interestRate / 100);
+                            totalInterest += interestForPeriod;
+                            pendingPayments.push({ 
+                                date: new Date(nextCut.getTime()), 
+                                interest: interestForPeriod,
+                                isProjected: false 
+                            });
+                        }
                     }
                 }
 
